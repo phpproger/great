@@ -368,18 +368,47 @@ def print_executive_summary(hist_swiglu_or_dict: Any, hist_plain: Optional[Dict[
     print("=" * 115)
 
 
+LABEL_MAP = {
+    "swiglu_baseline": "0. SwiGLU Baseline",
+    "plain_spectral": "1. Plain MLP + Spectral",
+    "swiglu_aux": "2. SwiGLU + Aux (λ=0.02)",
+    "swiglu_strong_aux": "3. SwiGLU + Strong Aux (λ=0.10, Global)",
+    "swiglu_cycle": "4. SwiGLU + Cycle Consistency",
+    "swiglu_k2_aux": "5. SwiGLU + k=2 Picard Aux",
+    "plain_spectral_cycle": "6. Plain + Spectral + Cycle",
+    "plain_strong_cycle": "7. Plain + Strong Cycle (Global)",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build Comparison Curves for 114M DDP Models")
     parser.add_argument("--dir", type=str, default="checkpoints_ddp", help="Directory containing history JSONs or checkpoints")
     parser.add_argument("--save", type=str, default="checkpoints_ddp/comparison_curves.png", help="Path to save output plot")
     args = parser.parse_args()
 
-    archs = ["swiglu_baseline", "plain_spectral", "swiglu_aux", "plain_spectral_cycle"]
+    known_archs = [
+        "swiglu_baseline", "plain_spectral", "swiglu_aux",
+        "swiglu_strong_aux", "swiglu_cycle", "swiglu_k2_aux",
+        "plain_spectral_cycle", "plain_strong_cycle"
+    ]
+    discovered = list(known_archs)
+    if os.path.exists(args.dir):
+        for f in os.listdir(args.dir):
+            if f.endswith("_history.json"):
+                name = f[:-len("_history.json")]
+                if name not in discovered:
+                    discovered.append(name)
+            elif f.endswith("_114m_best.pt"):
+                name = f[:-len("_114m_best.pt")]
+                if name not in discovered:
+                    discovered.append(name)
+
     histories = {}
-    for a in archs:
+    for a in discovered:
         h = load_architecture_history(args.dir, a)
         if h and len(h.get("val_steps", [])) > 0:
-            histories[a] = h
+            label = LABEL_MAP.get(a, a)
+            histories[label] = h
 
     print(f"[*] Found {len(histories)} trained architectures to plot: {list(histories.keys())}")
     print_executive_summary(histories)

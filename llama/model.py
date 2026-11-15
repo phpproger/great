@@ -311,15 +311,30 @@ class TransformerBlock(nn.Module):
         h_prev = (1.0 - alpha_attn) * g0_a + alpha_attn * g1_a
         return h_prev
 
-    def forward_and_invert(self, h_prev: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Executes forward pass and 1-step Banach inversion for auxiliary loss."""
+    def forward_and_invert(self, h_prev: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, k_steps: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Executes forward pass and k-step Banach inversion for auxiliary loss."""
         h_next, _ = self.forward(h_prev, cos=cos, sin=sin)
-        norm2 = self.post_attention_layernorm(h_next)
-        h_mid = h_next - self.mlp(norm2)
-        norm1 = self.input_layernorm(h_mid)
-        attn_rev, _ = self.self_attn(norm1, cos=cos, sin=sin)
-        h_in_rev = h_mid - attn_rev
-        return h_next, h_in_rev
+        if k_steps == 1:
+            norm2 = self.post_attention_layernorm(h_next)
+            h_mid = h_next - self.mlp(norm2)
+            norm1 = self.input_layernorm(h_mid)
+            attn_rev, _ = self.self_attn(norm1, cos=cos, sin=sin)
+            h_in_rev = h_mid - attn_rev
+            return h_next, h_in_rev
+        elif k_steps == 2:
+            # 2-step Picard MLP inverse
+            x0 = h_next
+            x1 = h_next - self.mlp(self.post_attention_layernorm(x0))
+            h_mid = h_next - self.mlp(self.post_attention_layernorm(x1))
+            # 2-step Picard Attention inverse
+            z0 = h_mid
+            attn0, _ = self.self_attn(self.input_layernorm(z0), cos=cos, sin=sin)
+            z1 = h_mid - attn0
+            attn1, _ = self.self_attn(self.input_layernorm(z1), cos=cos, sin=sin)
+            h_in_rev = h_mid - attn1
+            return h_next, h_in_rev
+        else:
+            return h_next, self.invert(h_next, cos=cos, sin=sin, k_steps=k_steps, method="picard")
 
 
 class LlamaModel(nn.Module):
@@ -377,6 +392,7 @@ class LlamaModel(nn.Module):
         # Stochastic single-layer rotation for Banach Contraction Loss B [Opt 4 & Opt 2]
         self.last_aux_loss = None
         chosen_layer = -1
+        k_steps = getattr(self.config, "aux_k_steps", 1)
         if self.training and getattr(self.config, "use_contraction_aux", False) and not use_cache:
             probs = getattr(self.config, "contraction_layer_probs", None)
             if probs is not None and len(probs) == len(self.layers):
@@ -384,14 +400,15 @@ class LlamaModel(nn.Module):
             else:
                 chosen_layer = random.randint(0, len(self.layers) - 1)
 
+        aux_loss = None
         for idx, layer in enumerate(self.layers):
             layer_past = past_key_values[idx] if past_key_values is not None else None
             if idx == chosen_layer:
                 h_prev = hidden_states
-                hidden_states, h_in_rev = layer.forward_and_invert(h_prev, cos=cos, sin=sin)
+                hidden_states, h_in_rev = layer.forward_and_invert(h_prev, cos=cos, sin=sin, k_steps=k_steps)
                 target = h_prev.detach()
                 rel_err = (h_in_rev - target).pow(2).sum(-1) / (target.pow(2).sum(-1) + 1e-4)
-                aux_loss = rel_err.mean()
+                layer_aux = rel_err.mean()
 
                 # Optional Round-Trip Cycle Consistency Loss: h -> h_rev -> h_rec == h_next
                 if getattr(self.config, "use_cycle_consistency", False):
@@ -399,16 +416,16 @@ class LlamaModel(nn.Module):
                     target_fw = hidden_states.detach()
                     rel_err_fw = (h_rec - target_fw).pow(2).sum(-1) / (target_fw.pow(2).sum(-1) + 1e-4)
                     cycle_weight = getattr(self.config, "cycle_consistency_weight", 0.25)
-                    aux_loss = aux_loss + cycle_weight * rel_err_fw.mean()
+                    layer_aux = layer_aux + cycle_weight * rel_err_fw.mean()
 
-                # Spectral Barrier Regularization on W_O and down_proj
-                if getattr(self.config, "use_spectral_barrier", False):
+                # Single-layer spectral barrier fallback (when not global)
+                if getattr(self.config, "use_spectral_barrier", False) and not getattr(self.config, "global_spectral_barrier", False):
                     sig_o = estimate_spectral_norm(layer.self_attn.o_proj.weight)
                     sig_d = estimate_spectral_norm(layer.mlp.down_proj.weight)
                     barrier = F.relu(sig_o - 1.0).pow(2) + F.relu(sig_d - 1.0).pow(2)
-                    aux_loss = aux_loss + 0.1 * barrier
+                    layer_aux = layer_aux + 0.1 * barrier
 
-                self.last_aux_loss = aux_loss
+                aux_loss = layer_aux
                 layer_cache = None
             else:
                 hidden_states, layer_cache = layer(
@@ -421,6 +438,21 @@ class LlamaModel(nn.Module):
                 )
             if use_cache:
                 next_decoder_cache.append(layer_cache)
+
+        # Global All-Layer Spectral Barrier Regularization (computed across all layers)
+        if self.training and getattr(self.config, "use_spectral_barrier", False) and getattr(self.config, "global_spectral_barrier", False):
+            total_barrier = torch.tensor(0.0, device=hidden_states.device)
+            for l in self.layers:
+                sig_o = estimate_spectral_norm(l.self_attn.o_proj.weight)
+                sig_d = estimate_spectral_norm(l.mlp.down_proj.weight)
+                total_barrier = total_barrier + F.relu(sig_o - 1.0).pow(2) + F.relu(sig_d - 1.0).pow(2)
+            avg_barrier = total_barrier / len(self.layers)
+            if aux_loss is not None:
+                aux_loss = aux_loss + 0.1 * avg_barrier
+            else:
+                aux_loss = 0.1 * avg_barrier
+
+        self.last_aux_loss = aux_loss
 
         hidden_states = self.norm(hidden_states)
         return hidden_states, next_decoder_cache
@@ -507,7 +539,7 @@ class LlamaForCausalLM(nn.Module):
             )
             # Add Banach Contraction Auxiliary Loss if training [Combo 1+2+4 baseline]
             aux_loss = getattr(self.model, "last_aux_loss", None)
-            if aux_loss is not None and self.training and getattr(self.config, "use_contraction_aux", False):
+            if aux_loss is not None and self.training and (getattr(self.config, "use_contraction_aux", False) or getattr(self.config, "global_spectral_barrier", False)):
                 weight = getattr(self.config, "contraction_aux_weight", 0.02)
                 loss = ce_loss + weight * aux_loss
             else:

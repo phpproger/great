@@ -135,14 +135,11 @@ def evaluate_loss(model, val_loader, vocab_size: int, device, is_distributed: bo
             if i >= max_batches:
                 break
             tokens = batch["input_ids"].to(device, non_blocking=True)
-            x = tokens[:, :-1].contiguous()
-            y = tokens[:, 1:].contiguous()
 
             with torch.amp.autocast("cuda", dtype=torch.float16 if torch.cuda.is_available() else torch.float32):
-                logits, _, _ = model(input_ids=x, labels=None)
-                ce = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
+                _, loss, _ = model(input_ids=tokens, labels=tokens)
 
-            total_loss += ce.item()
+            total_loss += loss.item()
             total_batches += 1.0
 
     if is_distributed:
@@ -201,14 +198,19 @@ def train_model(
     # Optimizer & Scaler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.max_steps,
+        eta_min=args.lr * 0.1,
+    )
 
-    # Auto-resume from existing checkpoint if available
+    # Auto-resume from existing checkpoint if explicitly requested
     save_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
     start_step = 0
     resumed = False
     resumed_best_val = None
 
-    if os.path.exists(save_path):
+    if getattr(args, "resume", False) and os.path.exists(save_path):
         try:
             print_rank0(f"  [Auto-Resume] Found existing checkpoint at {save_path}! Loading...", global_rank)
             ckpt_obj = torch.load(save_path, map_location=device)
@@ -281,8 +283,6 @@ def train_model(
 
         for batch in train_loader:
             tokens = batch["input_ids"].to(device, non_blocking=True)
-            x = tokens[:, :-1].contiguous()
-            y = tokens[:, 1:].contiguous()
 
             is_accumulating = (step + 1) % args.grad_accum != 0
 
@@ -290,7 +290,7 @@ def train_model(
             ddp_context = model.no_sync() if (is_distributed and is_accumulating) else nullcontext()
             with ddp_context:
                 with torch.amp.autocast("cuda", dtype=torch.float16 if torch.cuda.is_available() else torch.float32):
-                    logits, loss, _ = model(input_ids=x, labels=y)
+                    logits, loss, _ = model(input_ids=tokens, labels=tokens)
                     scaled_loss = loss / args.grad_accum
                 scaler.scale(scaled_loss).backward()
 
@@ -300,6 +300,7 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
 
             step += 1
 
@@ -396,6 +397,7 @@ def main():
     parser.add_argument("--eval_interval", type=int, default=50, help="Steps between validation evaluations")
     parser.add_argument("--patience", type=int, default=6, help="Number of evaluations without improvement before plateau")
     parser.add_argument("--min_delta", type=float, default=0.005, help="Minimum validation loss improvement delta")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint if available")
     args = parser.parse_args()
 
     is_distributed, global_rank, local_rank, world_size, device = init_distributed()
@@ -431,6 +433,8 @@ def main():
     # 3. Train requested architectures
     if args.arch in ["swiglu_baseline", "compare"]:
         cfg_swiglu = get_cfg("swiglu", use_spectral=False)
+        cfg_swiglu.use_contraction_aux = False
+        cfg_swiglu.scale_embeddings = False
         res_swi = train_model(
             cfg_swiglu,
             "swiglu_baseline",
@@ -447,6 +451,8 @@ def main():
 
     if args.arch in ["plain_spectral", "compare"]:
         cfg_plain_spec = get_cfg("plain", use_spectral=True)
+        cfg_plain_spec.use_contraction_aux = True
+        cfg_plain_spec.scale_embeddings = True
         res_plain = train_model(
             cfg_plain_spec,
             "plain_spectral",

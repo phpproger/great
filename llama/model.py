@@ -393,6 +393,14 @@ class LlamaModel(nn.Module):
                 rel_err = (h_in_rev - target).pow(2).sum(-1) / (target.pow(2).sum(-1) + 1e-4)
                 aux_loss = rel_err.mean()
 
+                # Optional Round-Trip Cycle Consistency Loss: h -> h_rev -> h_rec == h_next
+                if getattr(self.config, "use_cycle_consistency", False):
+                    h_rec, _ = layer(h_in_rev, cos=cos, sin=sin)
+                    target_fw = hidden_states.detach()
+                    rel_err_fw = (h_rec - target_fw).pow(2).sum(-1) / (target_fw.pow(2).sum(-1) + 1e-4)
+                    cycle_weight = getattr(self.config, "cycle_consistency_weight", 0.25)
+                    aux_loss = aux_loss + cycle_weight * rel_err_fw.mean()
+
                 # Spectral Barrier Regularization on W_O and down_proj
                 if getattr(self.config, "use_spectral_barrier", False):
                     sig_o = estimate_spectral_norm(layer.self_attn.o_proj.weight)

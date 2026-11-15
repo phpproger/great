@@ -30,6 +30,8 @@ class LlamaConfig:
     contraction_aux_weight: float = 0.02   # Lambda weight for Banach Contraction Loss
     use_spectral_barrier: bool = True      # Spectral Barrier Regularization (sigma(W) <= 1.0) on output projections
     spectral_barrier_weight: float = 0.002 # Effective weight for spectral barrier penalty
+    use_cycle_consistency: bool = False    # Enables round-trip forward-backward cycle consistency loss
+    cycle_consistency_weight: float = 0.25 # Lambda weight for cycle consistency loss term
     contraction_layer_probs: Optional[list] = None # Depth-weighted sampling [Opt 2 & 4]
     inversion_steps: int = 2               # Default test-time Banach fixed-point iterations
     default_inversion_method: str = "anderson" # Default test-time inversion solver ("anderson" or "picard")

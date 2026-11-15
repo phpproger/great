@@ -413,8 +413,9 @@ def train_model(
 # ============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Multi-GPU DDP Training for 100M+ Banach Contraction LLaMA Models on Kaggle T4x2")
-    parser.add_argument("--arch", type=str, default="compare", choices=["compare", "plain_spectral", "swiglu_baseline"],
-                        help="Architecture to train: 'plain_spectral' (champion), 'swiglu_baseline', or 'compare' (both)")
+    parser.add_argument("--arch", type=str, default="compare",
+                        choices=["compare", "plain_spectral", "swiglu_baseline", "plain_spectral_cycle", "all"],
+                        help="Architecture to train: 'plain_spectral' (champion), 'swiglu_baseline', 'plain_spectral_cycle', 'compare', or 'all'")
     parser.add_argument("--model_size", type=str, default="114m", choices=["114m", "small", "tiny"])
     parser.add_argument("--data_dir", type=str, default="data/wikitext", help="Path to pretokenized WikiText-103 files")
     parser.add_argument("--output_dir", type=str, default="checkpoints_ddp", help="Directory to save checkpoints")
@@ -480,7 +481,7 @@ def main():
         )
         results["swiglu_baseline"] = res_swi
 
-    if args.arch in ["plain_spectral", "compare"]:
+    if args.arch in ["plain_spectral", "compare", "all"]:
         cfg_plain_spec = get_cfg("plain", use_spectral=True)
         cfg_plain_spec.use_contraction_aux = True
         cfg_plain_spec.scale_embeddings = True
@@ -498,25 +499,42 @@ def main():
         )
         results["plain_spectral"] = res_plain
 
+    if args.arch in ["plain_spectral_cycle", "all"]:
+        cfg_cycle = get_cfg("plain", use_spectral=True)
+        cfg_cycle.use_contraction_aux = True
+        cfg_cycle.scale_embeddings = True
+        cfg_cycle.use_cycle_consistency = True
+        cfg_cycle.cycle_consistency_weight = 0.25
+        res_cycle = train_model(
+            cfg_cycle,
+            "plain_spectral_cycle",
+            args,
+            train_ds,
+            val_ds,
+            is_distributed,
+            global_rank,
+            local_rank,
+            world_size,
+            device,
+        )
+        results["plain_spectral_cycle"] = res_cycle
+
     # 4. Final Comparison Matrix (Rank 0)
     if global_rank == 0 and len(results) > 1:
-        print("\n" + "=" * 105)
+        print("\n" + "=" * 115)
         print("  114M DDP PRODUCTION COMPARISON MATRIX (TRAINED TO PLATEAU ON WIKITEXT-103 ON KAGGLE T4x2)")
-        print("=" * 105)
-        print(f"  {'Metric':<32} | {'0. SwiGLU Baseline':<28} | {'1. Plain MLP + Spectral (Champion)':<34}")
-        print("-" * 105)
-        r0 = results["swiglu_baseline"]
-        r1 = results["plain_spectral"]
-        print(f"  {'Parameters (Total)':<32} | {r0['total_params']:<28,d} | {r1['total_params']:<34,d}")
-        print(f"  {'Parameters (Non-Embedding)':<32} | {r0['non_emb_params']:<28,d} | {r1['non_emb_params']:<34,d}")
-        print(f"  {'Plateau Step':<32} | {r0['best_step']:<28d} | {r1['best_step']:<34d}")
-        print(f"  {'Peak VRAM Per GPU':<32} | {r0['peak_vram_gb']:<25.2f} GB | {r1['peak_vram_gb']:<31.2f} GB")
-        print(f"  {'Validation Cross-Entropy':<32} | {r0['best_val_loss']:<28.4f} | {r1['best_val_loss']:<34.4f}")
-        print(f"  {'Validation Perplexity (PPL)':<32} | {r0['best_val_ppl']:<28.2f} | {r1['best_val_ppl']:<34.2f}")
-        delta = r1['best_val_ppl'] - r0['best_val_ppl']
-        print(f"  {'Delta PPL vs Baseline':<32} | {'0.00 (Reference)':<28} | {delta:<+34.2f}")
-        print(f"  {'Total Training Time':<32} | {r0['total_time_sec']/60:<25.1f} min | {r1['total_time_sec']/60:<31.1f} min")
-        print("=" * 105)
+        print("=" * 115)
+        print(f"  {'Metric':<30} | " + " | ".join([f"{k:<24}" for k in results]))
+        print("-" * 115)
+        print(f"  {'Parameters (Total)':<30} | " + " | ".join([f"{r['total_params']:<24,d}" for r in results.values()]))
+        print(f"  {'Plateau Step':<30} | " + " | ".join([f"{r['best_step']:<24d}" for r in results.values()]))
+        print(f"  {'Peak VRAM Per GPU':<30} | " + " | ".join([f"{r['peak_vram_gb']:<21.2f} GB" for r in results.values()]))
+        print(f"  {'Validation Cross-Entropy':<30} | " + " | ".join([f"{r['best_val_loss']:<24.4f}" for r in results.values()]))
+        print(f"  {'Validation Perplexity (PPL)':<30} | " + " | ".join([f"{r['best_val_ppl']:<24.2f}" for r in results.values()]))
+        base_ppl = results.get("swiglu_baseline", list(results.values())[0])['best_val_ppl']
+        print(f"  {'Delta PPL vs Baseline':<30} | " + " | ".join([f"{r['best_val_ppl'] - base_ppl:<+24.2f}" for r in results.values()]))
+        print(f"  {'Total Training Time':<30} | " + " | ".join([f"{r['total_time_sec']/60:<20.1f} min" for r in results.values()]))
+        print("=" * 115)
 
     cleanup_distributed(is_distributed)
 

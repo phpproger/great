@@ -421,8 +421,8 @@ def train_model(
 def main():
     parser = argparse.ArgumentParser(description="Multi-GPU DDP Training for 100M+ Banach Contraction LLaMA Models on Kaggle T4x2")
     parser.add_argument("--arch", type=str, default="compare",
-                        choices=["compare", "plain_spectral", "swiglu_baseline", "plain_spectral_cycle", "all"],
-                        help="Architecture to train: 'plain_spectral' (champion), 'swiglu_baseline', 'plain_spectral_cycle', 'compare', or 'all'")
+                        choices=["compare", "plain_spectral", "swiglu_baseline", "swiglu_aux", "plain_spectral_cycle", "all"],
+                        help="Architecture to train: 'swiglu_aux' (SwiGLU + Aux Contraction), 'plain_spectral', 'swiglu_baseline', 'plain_spectral_cycle', 'compare', or 'all'")
     parser.add_argument("--model_size", type=str, default="114m", choices=["114m", "small", "tiny"])
     parser.add_argument("--data_dir", type=str, default="data/wikitext", help="Path to pretokenized WikiText-103 files")
     parser.add_argument("--output_dir", type=str, default="checkpoints_ddp", help="Directory to save checkpoints")
@@ -487,6 +487,24 @@ def main():
             device,
         )
         results["swiglu_baseline"] = res_swi
+
+    if args.arch in ["swiglu_aux", "all"]:
+        cfg_swi_aux = get_cfg("swiglu", use_spectral=True)
+        cfg_swi_aux.use_contraction_aux = True
+        cfg_swi_aux.scale_embeddings = True
+        res_swi_aux = train_model(
+            cfg_swi_aux,
+            "swiglu_aux",
+            args,
+            train_ds,
+            val_ds,
+            is_distributed,
+            global_rank,
+            local_rank,
+            world_size,
+            device,
+        )
+        results["swiglu_aux"] = res_swi_aux
 
     if args.arch in ["plain_spectral", "compare", "all"]:
         cfg_plain_spec = get_cfg("plain", use_spectral=True)

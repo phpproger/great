@@ -208,7 +208,7 @@ def train_model(
         batch_size=args.batch_size,
         sampler=train_sampler,
         shuffle=(train_sampler is None),
-        num_workers=4 if sys.platform != "win32" else 0,
+        num_workers=2 if sys.platform != "win32" else 0,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
     )
@@ -219,9 +219,12 @@ def train_model(
         batch_size=args.batch_size,
         sampler=val_sampler,
         shuffle=False,
-        num_workers=2 if sys.platform != "win32" else 0,
+        num_workers=1 if sys.platform != "win32" else 0,
         pin_memory=torch.cuda.is_available(),
     )
+
+    if len(train_loader) == 0:
+        raise RuntimeError(f"Train DataLoader has 0 batches! Dataset size ({len(train_dataset)}) is too small for batch_size={args.batch_size} and world_size={world_size}.")
 
     # Plateau tracking
     vocab_size = config.vocab_size
@@ -301,6 +304,9 @@ def train_model(
     peak_vram = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
     print_rank0(f"  Training for {arch_name} finished in {total_time:.1f}s ({total_time/60:.2f} min). Peak VRAM: {peak_vram:.2f} GB", global_rank)
     print_rank0(f"  Best Validation Loss: {best_val:.4f} | Best Validation PPL: {math.exp(min(best_val, 20)):.2f} at Step {best_step}", global_rank)
+
+    if is_distributed:
+        dist.barrier()
 
     return {
         "arch": arch_name,

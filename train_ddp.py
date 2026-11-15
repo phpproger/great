@@ -271,6 +271,7 @@ def train_model(
     history = {
         "train_steps": [],
         "train_losses": [],
+        "aux_losses": [],
         "lrs": [],
         "val_steps": [],
         "val_losses": [],
@@ -320,10 +321,14 @@ def train_model(
                 if step % 20 == 0:
                     current_lr = scheduler.get_last_lr()[0]
                     vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-                    print_rank0(f"  [Step {step:5d}/{args.max_steps}] Loss: {loss.item():.4f} | VRAM: {vram_gb:.2f} GB / 16.0 GB | LR: {current_lr:.2e}", global_rank)
+                    raw_m = model.module if hasattr(model, "module") else model
+                    aux_val = getattr(raw_m.model, "last_aux_loss", None)
+                    aux_str = f" | Aux: {aux_val.item():.4f}" if aux_val is not None else ""
+                    print_rank0(f"  [Step {step:5d}/{args.max_steps}] Loss: {loss.item():.4f}{aux_str} | VRAM: {vram_gb:.2f} GB / 16.0 GB | LR: {current_lr:.2e}", global_rank)
                     if global_rank == 0:
                         history["train_steps"].append(step)
                         history["train_losses"].append(round(loss.item(), 4))
+                        history["aux_losses"].append(round(aux_val.item(), 5) if aux_val is not None else 0.0)
                         history["lrs"].append(float(current_lr))
 
                 # Evaluation & Plateau Check every args.eval_interval optimizer steps
@@ -405,6 +410,8 @@ def train_model(
         "total_params": total_params,
         "non_emb_params": non_emb_params,
         "history": history,
+        "use_contraction_aux": getattr(config, "use_contraction_aux", False),
+        "use_spectral_barrier": getattr(config, "use_spectral_barrier", False),
     }
 
 
@@ -527,6 +534,8 @@ def main():
         print(f"  {'Metric':<30} | " + " | ".join([f"{k:<24}" for k in results]))
         print("-" * 115)
         print(f"  {'Parameters (Total)':<30} | " + " | ".join([f"{r['total_params']:<24,d}" for r in results.values()]))
+        print(f"  {'Aux Contraction Loss':<30} | " + " | ".join([f"{'Active (λ=0.02)' if r.get('use_contraction_aux') else 'Disabled':<24}" for r in results.values()]))
+        print(f"  {'Spectral Barrier (W_O, W_2)':<30} | " + " | ".join([f"{'Active (σ<=1.0)' if r.get('use_spectral_barrier') else 'Disabled':<24}" for r in results.values()]))
         print(f"  {'Plateau Step':<30} | " + " | ".join([f"{r['best_step']:<24d}" for r in results.values()]))
         print(f"  {'Peak VRAM Per GPU':<30} | " + " | ".join([f"{r['peak_vram_gb']:<21.2f} GB" for r in results.values()]))
         print(f"  {'Validation Cross-Entropy':<30} | " + " | ".join([f"{r['best_val_loss']:<24.4f}" for r in results.values()]))

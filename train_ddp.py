@@ -285,9 +285,8 @@ def train_model(
                     best_step = step
                     patience_counter = 0
                     if global_rank == 0:
-                        save_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
-                        torch.save(raw_model.state_dict(), save_path)
-                        print_rank0(f"      [Checkpoint Saved] New best validation loss {best_val:.4f} (PPL {best_ppl:.2f}) -> {save_path}" if 'best_ppl' in locals() else f"      [Checkpoint Saved] New best validation loss {best_val:.4f} -> {save_path}", global_rank)
+                        best_state_dict = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
+                        print_rank0(f"      [Best Model Updated] New best validation loss {best_val:.4f} (PPL {v_ppl:.2f})", global_rank)
                 else:
                     if step >= args.min_steps:
                         patience_counter += 1
@@ -304,6 +303,12 @@ def train_model(
     peak_vram = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
     print_rank0(f"  Training for {arch_name} finished in {total_time:.1f}s ({total_time/60:.2f} min). Peak VRAM: {peak_vram:.2f} GB", global_rank)
     print_rank0(f"  Best Validation Loss: {best_val:.4f} | Best Validation PPL: {math.exp(min(best_val, 20)):.2f} at Step {best_step}", global_rank)
+
+    # Save to disk only once at the very end when model converges to plateau
+    if global_rank == 0 and best_state_dict is not None:
+        save_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
+        torch.save(best_state_dict, save_path)
+        print_rank0(f"  [Checkpoint Saved] Wrote best plateau checkpoint to {save_path}", global_rank)
 
     if is_distributed:
         dist.barrier()

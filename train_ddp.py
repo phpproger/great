@@ -6,6 +6,7 @@ import copy
 import argparse
 import random
 import tempfile
+from contextlib import nullcontext
 from typing import Optional, Dict, Any, List
 
 import torch
@@ -124,7 +125,7 @@ def prepare_wikitext_data(data_dir: str, rank: int, is_distributed: bool):
 # ============================================================================
 # 3. EVALUATION ACROSS DISTRIBUTED PROCESSES
 # ============================================================================
-def evaluate_loss(model, val_loader, vocab_size: int, device, is_distributed: bool, max_batches: int = 50) -> float:
+def evaluate_loss(model, val_loader, vocab_size: int, device, is_distributed: bool, max_batches: int = 15) -> float:
     model.eval()
     total_loss = torch.tensor(0.0, device=device)
     total_batches = torch.tensor(0.0, device=device)
@@ -192,7 +193,7 @@ def train_model(
             raw_model,
             device_ids=[local_rank] if torch.cuda.is_available() else None,
             output_device=local_rank if torch.cuda.is_available() else None,
-            find_unused_parameters=True, # Due to stochastic depth layer sampling
+            find_unused_parameters=False, # Optimized: all transformer layers are in active residual path
         )
     else:
         model = raw_model
@@ -233,6 +234,7 @@ def train_model(
     best_step = 0
     patience_counter = 0
     plateau_reached = False
+    best_state_dict = None
 
     print_rank0(f"  Initial Validation Loss: {init_val:.4f} (Initial PPL: {math.exp(min(init_val, 20)):.2f})", global_rank)
     print_rank0(f"  Criterion: Train dynamically until plateau (min_steps={args.min_steps}, patience={args.patience} checks x {args.eval_interval} st = {args.patience * args.eval_interval} st)", global_rank)
@@ -253,13 +255,17 @@ def train_model(
             x = tokens[:, :-1].contiguous()
             y = tokens[:, 1:].contiguous()
 
-            with torch.amp.autocast("cuda", dtype=torch.float16 if torch.cuda.is_available() else torch.float32):
-                logits, loss, _ = model(input_ids=x, labels=y)
-                scaled_loss = loss / args.grad_accum
+            is_accumulating = (step + 1) % args.grad_accum != 0
 
-            scaler.scale(scaled_loss).backward()
+            # Suppress DDP all-reduce on accumulation micro-steps (huge speedup)
+            ddp_context = model.no_sync() if (is_distributed and is_accumulating) else nullcontext()
+            with ddp_context:
+                with torch.amp.autocast("cuda", dtype=torch.float16 if torch.cuda.is_available() else torch.float32):
+                    logits, loss, _ = model(input_ids=x, labels=y)
+                    scaled_loss = loss / args.grad_accum
+                scaler.scale(scaled_loss).backward()
 
-            if (step + 1) % args.grad_accum == 0:
+            if not is_accumulating:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)

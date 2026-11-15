@@ -3,6 +3,7 @@ import sys
 import math
 import time
 import copy
+import json
 import argparse
 import random
 import tempfile
@@ -267,6 +268,15 @@ def train_model(
     plateau_reached = False
     best_state_dict = None
 
+    history = {
+        "train_steps": [],
+        "train_losses": [],
+        "lrs": [],
+        "val_steps": [],
+        "val_losses": [],
+        "val_ppls": [],
+    }
+
     print_rank0(f"  Initial Validation Loss: {init_val:.4f} (Initial PPL: {math.exp(min(init_val, 20)):.2f})", global_rank)
     print_rank0(f"  Criterion: Train dynamically until plateau (min_steps={args.min_steps}, patience={args.patience} checks x {args.eval_interval} st = {args.patience * args.eval_interval} st)", global_rank)
     print_rank0("-" * 115, global_rank)
@@ -311,6 +321,10 @@ def train_model(
                     current_lr = scheduler.get_last_lr()[0]
                     vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
                     print_rank0(f"  [Step {step:5d}/{args.max_steps}] Loss: {loss.item():.4f} | VRAM: {vram_gb:.2f} GB / 16.0 GB | LR: {current_lr:.2e}", global_rank)
+                    if global_rank == 0:
+                        history["train_steps"].append(step)
+                        history["train_losses"].append(round(loss.item(), 4))
+                        history["lrs"].append(float(current_lr))
 
                 # Evaluation & Plateau Check every args.eval_interval optimizer steps
                 if step % args.eval_interval == 0:
@@ -318,6 +332,11 @@ def train_model(
                     v_ppl = math.exp(min(v_loss, 20))
                     vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
                     print_rank0(f"  --> [Check @ Step {step:5d}] Val Loss: {v_loss:.4f} | Val PPL: {v_ppl:.2f} | Peak VRAM: {vram_gb:.2f} GB", global_rank)
+
+                    if global_rank == 0:
+                        history["val_steps"].append(step)
+                        history["val_losses"].append(round(v_loss, 4))
+                        history["val_ppls"].append(round(v_ppl, 2))
 
                     if v_loss < best_val - args.min_delta:
                         best_val = v_loss
@@ -333,9 +352,13 @@ def train_model(
                                     "step": best_step,
                                     "best_val": best_val,
                                     "optimizer_state_dict": optimizer.state_dict(),
+                                    "history": history,
                                 }
                                 torch.save(ckpt_obj, save_path)
-                                print_rank0(f"      [Periodic Checkpoint Saved] Saved snapshot to {save_path}", global_rank)
+                                hist_path = os.path.join(output_dir, f"{arch_name}_history.json")
+                                with open(hist_path, "w") as f:
+                                    json.dump(history, f, indent=2)
+                                print_rank0(f"      [Periodic Checkpoint Saved] Saved snapshot & history to {save_path}", global_rank)
                     else:
                         if step >= args.min_steps:
                             patience_counter += 1
@@ -361,9 +384,13 @@ def train_model(
             "step": best_step,
             "best_val": best_val,
             "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
         }
         torch.save(ckpt_obj, save_path)
-        print_rank0(f"  [Checkpoint Saved] Wrote final best plateau checkpoint to {save_path}", global_rank)
+        hist_path = os.path.join(output_dir, f"{arch_name}_history.json")
+        with open(hist_path, "w") as f:
+            json.dump(history, f, indent=2)
+        print_rank0(f"  [Checkpoint Saved] Wrote final best plateau checkpoint & history to {save_path}", global_rank)
 
     if is_distributed:
         dist.barrier()
@@ -377,6 +404,7 @@ def train_model(
         "peak_vram_gb": peak_vram,
         "total_params": total_params,
         "non_emb_params": non_emb_params,
+        "history": history,
     }
 
 

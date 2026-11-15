@@ -272,7 +272,8 @@ def train_model(
     print_rank0("-" * 115, global_rank)
 
     step = start_step
-    epoch = start_step // max(1, len(train_loader))
+    micro_step = start_step * args.grad_accum
+    epoch = (start_step * args.grad_accum) // max(1, len(train_loader))
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
 
@@ -284,7 +285,7 @@ def train_model(
         for batch in train_loader:
             tokens = batch["input_ids"].to(device, non_blocking=True)
 
-            is_accumulating = (step + 1) % args.grad_accum != 0
+            is_accumulating = (micro_step + 1) % args.grad_accum != 0
 
             # Suppress DDP all-reduce on accumulation micro-steps (huge speedup)
             ddp_context = model.no_sync() if (is_distributed and is_accumulating) else nullcontext()
@@ -294,6 +295,8 @@ def train_model(
                     scaled_loss = loss / args.grad_accum
                 scaler.scale(scaled_loss).backward()
 
+            micro_step += 1
+
             if not is_accumulating:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -301,46 +304,46 @@ def train_model(
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
+                step += 1
 
-            step += 1
+                # Logging & VRAM monitoring every 20 optimizer steps
+                if step % 20 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+                    print_rank0(f"  [Step {step:5d}/{args.max_steps}] Loss: {loss.item():.4f} | VRAM: {vram_gb:.2f} GB / 16.0 GB | LR: {current_lr:.2e}", global_rank)
 
-            # Logging & VRAM monitoring
-            if step % 20 == 0:
-                vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-                print_rank0(f"  [Step {step:5d}/{args.max_steps}] Loss: {loss.item():.4f} | VRAM: {vram_gb:.2f} GB / 16.0 GB | LR: {args.lr:.2e}", global_rank)
+                # Evaluation & Plateau Check every args.eval_interval optimizer steps
+                if step % args.eval_interval == 0:
+                    v_loss = evaluate_loss(model, val_loader, vocab_size, device, is_distributed)
+                    v_ppl = math.exp(min(v_loss, 20))
+                    vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
+                    print_rank0(f"  --> [Check @ Step {step:5d}] Val Loss: {v_loss:.4f} | Val PPL: {v_ppl:.2f} | Peak VRAM: {vram_gb:.2f} GB", global_rank)
 
-            # Evaluation & Plateau Check
-            if step % args.eval_interval == 0:
-                v_loss = evaluate_loss(model, val_loader, vocab_size, device, is_distributed)
-                v_ppl = math.exp(min(v_loss, 20))
-                vram_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
-                print_rank0(f"  --> [Check @ Step {step:5d}] Val Loss: {v_loss:.4f} | Val PPL: {v_ppl:.2f} | Peak VRAM: {vram_gb:.2f} GB", global_rank)
-
-                if v_loss < best_val - args.min_delta:
-                    best_val = v_loss
-                    best_step = step
-                    patience_counter = 0
-                    if global_rank == 0:
-                        best_state_dict = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
-                        print_rank0(f"      [Best Model Updated] New best validation loss {best_val:.4f} (PPL {v_ppl:.2f})", global_rank)
-                        # Periodic snapshot every 200 steps so auto-resume can recover if interrupted
-                        if step % 200 == 0:
-                            ckpt_obj = {
-                                "model_state_dict": best_state_dict,
-                                "step": best_step,
-                                "best_val": best_val,
-                                "optimizer_state_dict": optimizer.state_dict(),
-                            }
-                            torch.save(ckpt_obj, save_path)
-                            print_rank0(f"      [Periodic Checkpoint Saved] Saved snapshot to {save_path}", global_rank)
-                else:
-                    if step >= args.min_steps:
-                        patience_counter += 1
-                        print_rank0(f"      [Plateau Alert] No improvement >= {args.min_delta} for {patience_counter}/{args.patience} checks", global_rank)
-                        if patience_counter >= args.patience:
-                            plateau_reached = True
-                            print_rank0(f"      [CONVERGED] Dynamic plateau achieved at step {best_step}!", global_rank)
-                            break
+                    if v_loss < best_val - args.min_delta:
+                        best_val = v_loss
+                        best_step = step
+                        patience_counter = 0
+                        if global_rank == 0:
+                            best_state_dict = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
+                            print_rank0(f"      [Best Model Updated] New best validation loss {best_val:.4f} (PPL {v_ppl:.2f})", global_rank)
+                            # Periodic snapshot every 200 optimizer steps so auto-resume can recover if interrupted
+                            if step % 200 == 0:
+                                ckpt_obj = {
+                                    "model_state_dict": best_state_dict,
+                                    "step": best_step,
+                                    "best_val": best_val,
+                                    "optimizer_state_dict": optimizer.state_dict(),
+                                }
+                                torch.save(ckpt_obj, save_path)
+                                print_rank0(f"      [Periodic Checkpoint Saved] Saved snapshot to {save_path}", global_rank)
+                    else:
+                        if step >= args.min_steps:
+                            patience_counter += 1
+                            print_rank0(f"      [Plateau Alert] No improvement >= {args.min_delta} for {patience_counter}/{args.patience} checks", global_rank)
+                            if patience_counter >= args.patience:
+                                plateau_reached = True
+                                print_rank0(f"      [CONVERGED] Dynamic plateau achieved at step {best_step}!", global_rank)
+                                break
 
             if step >= args.max_steps:
                 break

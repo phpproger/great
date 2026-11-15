@@ -27,12 +27,25 @@ def parse_history_from_json(json_path: str) -> Optional[Dict[str, Any]]:
 
 
 def parse_history_from_checkpoint(ckpt_path: str) -> Optional[Dict[str, Any]]:
-    """Loads history saved directly inside checkpoint."""
+    """Loads history saved directly inside checkpoint, with fallback to best_val scalar."""
     if os.path.exists(ckpt_path):
         try:
             ckpt = torch.load(ckpt_path, map_location="cpu")
-            if isinstance(ckpt, dict) and "history" in ckpt:
-                return ckpt["history"]
+            if isinstance(ckpt, dict):
+                if "history" in ckpt:
+                    return ckpt["history"]
+                # Fallback: extract summary endpoint from checkpoint metadata
+                if "best_val" in ckpt and "step" in ckpt:
+                    bv = float(ckpt["best_val"])
+                    st = int(ckpt["step"])
+                    return {
+                        "train_steps": [st],
+                        "train_losses": [bv],
+                        "lrs": [],
+                        "val_steps": [st],
+                        "val_losses": [bv],
+                        "val_ppls": [math.exp(min(bv, 20))],
+                    }
         except Exception as e:
             print(f"[!] Warning reading checkpoint {ckpt_path}: {e}")
     return None
@@ -72,21 +85,51 @@ def parse_history_from_log_text(log_text: str) -> Dict[str, Any]:
     return history
 
 
+def load_all_histories_from_log(log_path_or_text: str) -> Dict[str, Dict[str, Any]]:
+    """Splits a combined multi-architecture DDP log into per-architecture histories."""
+    if os.path.exists(log_path_or_text):
+        with open(log_path_or_text, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = log_path_or_text
+
+    # Split by STARTING DDP TRAINING: <NAME>
+    sections = re.split(r"STARTING DDP TRAINING:\s*([A-Za-z0-9_]+)", text, flags=re.IGNORECASE)
+    results = {}
+    if len(sections) > 1:
+        for i in range(1, len(sections), 2):
+            raw_arch = sections[i].lower().strip()
+            if "swiglu_baseline" in raw_arch:
+                arch_key = "swiglu_baseline"
+            elif "plain_spectral" in raw_arch:
+                arch_key = "plain_spectral"
+            elif "swiglu_aux" in raw_arch:
+                arch_key = "swiglu_aux"
+            else:
+                arch_key = raw_arch
+            sec_text = sections[i + 1]
+            hist = parse_history_from_log_text(sec_text)
+            if len(hist.get("val_steps", [])) > 0:
+                results[arch_key] = hist
+    return results
+
+
 def load_architecture_history(output_dir: str, arch_name: str, fallback_log_text: Optional[str] = None) -> Dict[str, Any]:
-    """Tries JSON -> Checkpoint -> Raw Log parsing in order of preference."""
-    # 1. JSON
+    """Tries JSON -> Checkpoint -> Log files -> Fallback text in order of preference."""
+    # 1. JSON history
     json_path = os.path.join(output_dir, f"{arch_name}_history.json")
     hist = parse_history_from_json(json_path)
     if hist and len(hist.get("val_steps", [])) > 0:
         return hist
 
-    # 2. Checkpoint
-    ckpt_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
-    hist = parse_history_from_checkpoint(ckpt_path)
-    if hist and len(hist.get("val_steps", [])) > 0:
-        return hist
+    # 2. Combined training.log on disk
+    comb_log = os.path.join(output_dir, "training.log")
+    if os.path.exists(comb_log):
+        all_h = load_all_histories_from_log(comb_log)
+        if arch_name in all_h and len(all_h[arch_name].get("val_steps", [])) > 0:
+            return all_h[arch_name]
 
-    # 3. Log file on disk
+    # 3. Individual arch log file on disk
     log_file = os.path.join(output_dir, f"{arch_name}.log")
     if os.path.exists(log_file):
         with open(log_file, "r", encoding="utf-8") as f:
@@ -96,9 +139,18 @@ def load_architecture_history(output_dir: str, arch_name: str, fallback_log_text
 
     # 4. Provided fallback log text
     if fallback_log_text:
+        all_h = load_all_histories_from_log(fallback_log_text)
+        if arch_name in all_h and len(all_h[arch_name].get("val_steps", [])) > 0:
+            return all_h[arch_name]
         hist = parse_history_from_log_text(fallback_log_text)
         if len(hist.get("val_steps", [])) > 0:
             return hist
+
+    # 5. Checkpoint metadata fallback
+    ckpt_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
+    hist = parse_history_from_checkpoint(ckpt_path)
+    if hist and len(hist.get("val_steps", [])) > 0:
+        return hist
 
     return {"train_steps": [], "train_losses": [], "lrs": [], "val_steps": [], "val_losses": [], "val_ppls": []}
 
@@ -157,8 +209,9 @@ def plot_comparison_curves(
         all_min_ppl.append(min_p)
         min_p_step = v_steps[v_ppls.index(min_p)]
 
-        ax1.plot(v_steps, v_ppls, label=f"{name} (Best: {min_p:.2f})", color=c, linewidth=2.2, marker=m, markersize=4, alpha=0.9)
-        ax1.scatter([min_p_step], [min_p], color=c, s=110, zorder=5, edgecolors="black", linewidth=1.2)
+        if len(v_steps) > 1:
+            ax1.plot(v_steps, v_ppls, label=f"{name} (Best: {min_p:.2f})", color=c, linewidth=2.2, marker=m, markersize=4, alpha=0.9)
+        ax1.scatter([min_p_step], [min_p], color=c, s=110, zorder=5, edgecolors="black", linewidth=1.2, label=f"{name} Best ({min_p:.2f})" if len(v_steps) == 1 else None)
 
     # Reference line for GPT-2 Small baseline (37.5 PPL on WikiText-103)
     ax1.axhline(37.5, color="#6C757D", linestyle="--", linewidth=1.4, alpha=0.8, label="OpenAI GPT-2 Small (37.50 PPL)")
@@ -167,7 +220,9 @@ def plot_comparison_curves(
     ax1.set_ylabel("Validation Perplexity (PPL)", fontsize=11)
     if all_min_ppl:
         ax1.set_ylim(bottom=max(15, min(all_min_ppl) - 8))
-    ax1.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
+    h_l, l_l = ax1.get_legend_handles_labels()
+    if h_l:
+        ax1.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
     ax1.grid(True, linestyle=":", alpha=0.6)
 
     # -------------------------------------------------------------------------
@@ -181,12 +236,17 @@ def plot_comparison_curves(
             continue
         c = palette[idx % len(palette)]
         m = markers[idx % len(markers)]
-        ax2.plot(h["val_steps"], h["val_losses"], label=name, color=c, linewidth=2.2, marker=m, markersize=4)
+        if len(h["val_steps"]) > 1:
+            ax2.plot(h["val_steps"], h["val_losses"], label=name, color=c, linewidth=2.2, marker=m, markersize=4)
+        else:
+            ax2.scatter(h["val_steps"], h["val_losses"], color=c, s=110, zorder=5, edgecolors="black", label=name)
 
     ax2.set_title("Validation Cross-Entropy Loss vs Step", fontsize=13, fontweight="bold", pad=10)
     ax2.set_xlabel("Optimizer Steps", fontsize=11)
     ax2.set_ylabel("Cross-Entropy Loss (nats)", fontsize=11)
-    ax2.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
+    h_l, l_l = ax2.get_legend_handles_labels()
+    if h_l:
+        ax2.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
     ax2.grid(True, linestyle=":", alpha=0.6)
 
     # -------------------------------------------------------------------------
@@ -201,14 +261,19 @@ def plot_comparison_curves(
         c = palette[idx % len(palette)]
         steps = h["train_steps"]
         raw = h["train_losses"]
-        sm = smooth(raw, window=5)
-        ax3.plot(steps[:len(raw)], raw, color=c, alpha=0.18, linewidth=0.8)
-        ax3.plot(steps[len(steps)-len(sm):], sm, label=f"{name} (Train)", color=c, linewidth=2.0)
+        if len(raw) > 5:
+            sm = smooth(raw, window=5)
+            ax3.plot(steps[:len(raw)], raw, color=c, alpha=0.18, linewidth=0.8)
+            ax3.plot(steps[len(steps)-len(sm):], sm, label=f"{name} (Train)", color=c, linewidth=2.0)
+        else:
+            ax3.scatter(steps, raw, color=c, label=f"{name} (Train)")
 
     ax3.set_title("Training Loss Dynamics & Stability", fontsize=13, fontweight="bold", pad=10)
     ax3.set_xlabel("Optimizer Steps", fontsize=11)
     ax3.set_ylabel("Training Cross-Entropy Loss", fontsize=11)
-    ax3.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
+    h_l, l_l = ax3.get_legend_handles_labels()
+    if h_l:
+        ax3.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
     ax3.grid(True, linestyle=":", alpha=0.6)
 
     # -------------------------------------------------------------------------
@@ -229,7 +294,9 @@ def plot_comparison_curves(
     ax4.set_title("Learning Rate Decay & Convergence Points", fontsize=13, fontweight="bold", pad=10)
     ax4.set_xlabel("Optimizer Steps", fontsize=11)
     ax4.set_ylabel("Learning Rate", fontsize=11)
-    ax4.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
+    h_l, l_l = ax4.get_legend_handles_labels()
+    if h_l:
+        ax4.legend(frameon=True, facecolor="white", framealpha=0.9, fontsize=9.5)
     ax4.grid(True, linestyle=":", alpha=0.6)
 
     plt.suptitle("114M Parameter Model Comparison on WikiText-103 (Kaggle 2x Tesla T4)\nEmpirical Perplexity & Convergence Trajectories", fontsize=15, fontweight="bold", y=0.99)
@@ -303,7 +370,7 @@ def print_executive_summary(hist_swiglu_or_dict: Any, hist_plain: Optional[Dict[
 
 def main():
     parser = argparse.ArgumentParser(description="Build Comparison Curves for 114M DDP Models")
-    parser.add_argument("--dir", type=str, default="checkpoints_ddp", help="Directory containing history JSONs")
+    parser.add_argument("--dir", type=str, default="checkpoints_ddp", help="Directory containing history JSONs or checkpoints")
     parser.add_argument("--save", type=str, default="checkpoints_ddp/comparison_curves.png", help="Path to save output plot")
     args = parser.parse_args()
 

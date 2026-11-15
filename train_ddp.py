@@ -72,9 +72,21 @@ def cleanup_distributed(is_distributed: bool):
         dist.destroy_process_group()
 
 
+LOG_FILE_PATH = None
+
+def set_log_file(path: str):
+    global LOG_FILE_PATH
+    LOG_FILE_PATH = path
+
 def print_rank0(msg: str, rank: int = 0):
     if rank == 0:
         print(msg, flush=True)
+        if LOG_FILE_PATH:
+            try:
+                with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -167,6 +179,7 @@ def train_model(
     device,
 ) -> Dict[str, Any]:
     output_dir = safe_makedirs(args.output_dir)
+    set_log_file(os.path.join(output_dir, "training.log"))
 
     print_rank0("\n" + "=" * 115, global_rank)
     print_rank0(f"  STARTING DDP TRAINING: {arch_name.upper()} (114M PARAMETERS ON KAGGLE T4x2)", global_rank)

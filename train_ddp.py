@@ -330,10 +330,10 @@ def main():
     parser.add_argument("--model_size", type=str, default="114m", choices=["114m", "small", "tiny"])
     parser.add_argument("--data_dir", type=str, default="data/wikitext", help="Path to pretokenized WikiText-103 files")
     parser.add_argument("--output_dir", type=str, default="checkpoints_ddp", help="Directory to save checkpoints")
-    # Tuned to maximize 16GB VRAM on each Tesla T4:
-    parser.add_argument("--seq_len", type=int, default=1024, help="Sequence context length (default 1024 tokens)")
-    parser.add_argument("--batch_size", type=int, default=24, help="Batch size per GPU (default 24 sequences = 24k tokens/GPU)")
-    parser.add_argument("--grad_accum", type=int, default=2, help="Gradient accumulation steps (effective 98,304 tokens/step)")
+    # Tuned for Tesla T4 (16GB VRAM each):
+    parser.add_argument("--seq_len", type=int, default=512, help="Sequence context length (default 512 tokens)")
+    parser.add_argument("--batch_size", type=int, default=12, help="Batch size per GPU (default 12, uses ~10 GB VRAM; use 16 for ~13.5 GB)")
+    parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective 49,152 tokens/step)")
     parser.add_argument("--lr", type=float, default=4e-4, help="Peak learning rate")
     parser.add_argument("--min_steps", type=int, default=400, help="Minimum steps before plateau patience activates")
     parser.add_argument("--max_steps", type=int, default=4000, help="Maximum training steps")

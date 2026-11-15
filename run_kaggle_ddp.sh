@@ -11,13 +11,13 @@ nvidia-smi
 # Check Python & PyTorch
 python -c "import torch; print(f'PyTorch {torch.__version__} | CUDA Available: {torch.cuda.is_available()} | Device Count: {torch.cuda.device_count()}')"
 
-# Launch 2-GPU DDP training with torchrun (Tuned to saturate 16GB VRAM per Tesla T4)
+# Launch 2-GPU DDP training with torchrun (Tuned for Tesla T4, utilizes ~11.6 GB VRAM per GPU)
 torchrun --nproc_per_node=2 train_ddp.py \
     --arch compare \
     --model_size 114m \
-    --seq_len 1024 \
-    --batch_size 24 \
-    --grad_accum 2 \
+    --seq_len 512 \
+    --batch_size 12 \
+    --grad_accum 4 \
     --lr 4e-4 \
     --min_steps 400 \
     --max_steps 4000 \

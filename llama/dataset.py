@@ -105,13 +105,14 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
 class WikiTextDataset(Dataset):
     """Memory-mapped pretokenized WikiText-103 dataset.
-    Provides fast, zero-copy access to 116M+ tokens with article boundaries.
+    Provides fast, zero-copy access to continuous token streams chunked into seq_len blocks.
+    Guarantees full utilization of all 116M+ tokens across articles and paragraphs.
     """
     def __init__(
         self,
         data_dir: str = "data/wikitext",
         split: str = "train",
-        seq_len: int = 32,
+        seq_len: int = 1024,
         pairs: bool = False,
         max_samples: Optional[int] = None,
         stride: Optional[int] = None,
@@ -121,36 +122,27 @@ class WikiTextDataset(Dataset):
         self.window = 2 * seq_len if pairs else seq_len
         self.stride = stride if stride is not None else self.window
 
-        offsets_file = os.path.join(data_dir, f"{split}-offsets.npy")
         tokens_file = os.path.join(data_dir, f"{split}-tokens.bin")
-
         if not os.path.exists(tokens_file):
             raise FileNotFoundError(f"Missing wikitext tokens file at {tokens_file}")
 
-        self.offsets = np.load(offsets_file)
         self.tokens = np.memmap(tokens_file, dtype="<u4", mode="r")
+        total_tokens = len(self.tokens)
 
-        # Build list of valid (start, end) coordinate windows within articles
-        self.samples = []
-        num_articles = len(self.offsets)
-        for i in range(num_articles):
-            art_start = int(self.offsets[i])
-            art_end = int(self.offsets[i + 1]) if i + 1 < num_articles else len(self.tokens)
-            art_len = art_end - art_start
-            if art_len < self.window:
-                continue
-            for pos in range(art_start, art_end - self.window + 1, self.stride):
-                self.samples.append(pos)
-                if max_samples and len(self.samples) >= max_samples:
-                    break
-            if max_samples and len(self.samples) >= max_samples:
-                break
+        # Robust continuous chunking across the complete token stream
+        total_possible = max(0, (total_tokens - self.window) // self.stride + 1)
+        if max_samples is not None:
+            self.num_samples = min(total_possible, max_samples)
+        else:
+            self.num_samples = total_possible
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        start = self.samples[idx]
+        if idx < 0 or idx >= self.num_samples:
+            raise IndexError(f"Index {idx} out of range for dataset of size {self.num_samples}")
+        start = idx * self.stride
         block = torch.from_numpy(self.tokens[start : start + self.window].astype(np.int64))
 
         if self.pairs:

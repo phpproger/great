@@ -22,8 +22,8 @@ torchrun --nproc_per_node=2 train_ddp.py \
     --min_steps 400 \
     --max_steps 4000 \
     --eval_interval 50 \
-    --patience 6 \
-    --min_delta 0.005 \
+    --patience 8 \
+    --min_delta 0.001 \
     --output_dir checkpoints_ddp
 
 echo "===================================================================="

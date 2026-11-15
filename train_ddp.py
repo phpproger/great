@@ -398,8 +398,8 @@ def main():
     parser.add_argument("--min_steps", type=int, default=400, help="Minimum steps before plateau patience activates")
     parser.add_argument("--max_steps", type=int, default=4000, help="Maximum training steps")
     parser.add_argument("--eval_interval", type=int, default=50, help="Steps between validation evaluations")
-    parser.add_argument("--patience", type=int, default=6, help="Number of evaluations without improvement before plateau")
-    parser.add_argument("--min_delta", type=float, default=0.005, help="Minimum validation loss improvement delta")
+    parser.add_argument("--patience", type=int, default=8, help="Number of evaluations without improvement before plateau")
+    parser.add_argument("--min_delta", type=float, default=0.001, help="Minimum validation loss improvement delta (default 0.001)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint if available")
     args = parser.parse_args()
 

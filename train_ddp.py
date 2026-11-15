@@ -202,6 +202,32 @@ def train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
+    # Auto-resume from existing checkpoint if available
+    save_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
+    start_step = 0
+    resumed = False
+    resumed_best_val = None
+
+    if os.path.exists(save_path):
+        try:
+            print_rank0(f"  [Auto-Resume] Found existing checkpoint at {save_path}! Loading...", global_rank)
+            ckpt_obj = torch.load(save_path, map_location=device)
+            if isinstance(ckpt_obj, dict) and "model_state_dict" in ckpt_obj:
+                raw_model.load_state_dict(ckpt_obj["model_state_dict"])
+                start_step = ckpt_obj.get("step", 0)
+                resumed_best_val = ckpt_obj.get("best_val", None)
+                if "optimizer_state_dict" in ckpt_obj and ckpt_obj["optimizer_state_dict"] is not None:
+                    try:
+                        optimizer.load_state_dict(ckpt_obj["optimizer_state_dict"])
+                    except Exception:
+                        pass
+            else:
+                raw_model.load_state_dict(ckpt_obj)
+            resumed = True
+            print_rank0(f"  [Auto-Resume Success] Restored model weights from {save_path} (resuming from step {start_step})", global_rank)
+        except Exception as e:
+            print_rank0(f"  [Auto-Resume Warning] Could not load {save_path}: {e}. Starting fresh.", global_rank)
+
     # Data loaders
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=global_rank, shuffle=True, seed=42) if is_distributed else None
     train_loader = DataLoader(
@@ -230,8 +256,11 @@ def train_model(
     # Plateau tracking
     vocab_size = config.vocab_size
     init_val = evaluate_loss(model, val_loader, vocab_size, device, is_distributed)
-    best_val = init_val
-    best_step = 0
+    if resumed and resumed_best_val is not None:
+        best_val = min(init_val, resumed_best_val)
+    else:
+        best_val = init_val
+    best_step = start_step
     patience_counter = 0
     plateau_reached = False
     best_state_dict = None
@@ -240,8 +269,8 @@ def train_model(
     print_rank0(f"  Criterion: Train dynamically until plateau (min_steps={args.min_steps}, patience={args.patience} checks x {args.eval_interval} st = {args.patience * args.eval_interval} st)", global_rank)
     print_rank0("-" * 115, global_rank)
 
-    step = 0
-    epoch = 0
+    step = start_step
+    epoch = start_step // max(1, len(train_loader))
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
 
@@ -293,6 +322,16 @@ def train_model(
                     if global_rank == 0:
                         best_state_dict = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
                         print_rank0(f"      [Best Model Updated] New best validation loss {best_val:.4f} (PPL {v_ppl:.2f})", global_rank)
+                        # Periodic snapshot every 200 steps so auto-resume can recover if interrupted
+                        if step % 200 == 0:
+                            ckpt_obj = {
+                                "model_state_dict": best_state_dict,
+                                "step": best_step,
+                                "best_val": best_val,
+                                "optimizer_state_dict": optimizer.state_dict(),
+                            }
+                            torch.save(ckpt_obj, save_path)
+                            print_rank0(f"      [Periodic Checkpoint Saved] Saved snapshot to {save_path}", global_rank)
                 else:
                     if step >= args.min_steps:
                         patience_counter += 1
@@ -310,11 +349,17 @@ def train_model(
     print_rank0(f"  Training for {arch_name} finished in {total_time:.1f}s ({total_time/60:.2f} min). Peak VRAM: {peak_vram:.2f} GB", global_rank)
     print_rank0(f"  Best Validation Loss: {best_val:.4f} | Best Validation PPL: {math.exp(min(best_val, 20)):.2f} at Step {best_step}", global_rank)
 
-    # Save to disk only once at the very end when model converges to plateau
+    # Save final best checkpoint to disk when model converges to plateau
     if global_rank == 0 and best_state_dict is not None:
         save_path = os.path.join(output_dir, f"{arch_name}_114m_best.pt")
-        torch.save(best_state_dict, save_path)
-        print_rank0(f"  [Checkpoint Saved] Wrote best plateau checkpoint to {save_path}", global_rank)
+        ckpt_obj = {
+            "model_state_dict": best_state_dict,
+            "step": best_step,
+            "best_val": best_val,
+            "optimizer_state_dict": optimizer.state_dict(),
+        }
+        torch.save(ckpt_obj, save_path)
+        print_rank0(f"  [Checkpoint Saved] Wrote final best plateau checkpoint to {save_path}", global_rank)
 
     if is_distributed:
         dist.barrier()
